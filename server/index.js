@@ -1,0 +1,588 @@
+import express from 'express';
+import mongoose from 'mongoose';
+import cors from 'cors';
+import dotenv from 'dotenv';
+import dns from 'dns';
+import { transformOrder } from './services/orderTransformer.js';
+import Order from './models/Order.js';
+import Product from './models/Product.js';
+import Integration from './models/Integration.js';
+import { verifyShopifyWebhook, verifyWooCommerceWebhook } from './integrations/security.js';
+import { syncShopifyOrders, syncShopifyProducts } from './integrations/shopify.js';
+import { syncWooCommerceOrders, syncWooCommerceProducts } from './integrations/woocommerce.js';
+import { updateStockFromOrder } from './services/stockService.js';
+import { pushInventoryToPlatform } from './services/inventoryPush.js';
+import { pushOrderStatusToPlatform } from './services/orderPush.js';
+import { pushProductToPlatform } from './services/productPush.js';
+import Supplier from './models/Supplier.js';
+import PurchaseOrder from './models/PurchaseOrder.js';
+import SupplierPayment from './models/SupplierPayment.js';
+import Warehouse from './models/Warehouse.js';
+import Variant from './models/Variant.js';
+import Inventory from './models/Inventory.js';
+import { receiveStock, adjustStock } from './services/stockService.js';
+
+
+dotenv.config();
+
+// Fix SRV DNS resolution on Windows (querySrv ECONNREFUSED)
+// Forces Node to use Google's public DNS which reliably resolves SRV records
+dns.setServers(['8.8.8.8', '8.8.4.4', '1.1.1.1']);
+dns.setDefaultResultOrder('ipv4first');
+
+const corsOptions = {
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Shopify-Hmac-Sha256', 'X-WC-Webhook-Signature'],
+  optionsSuccessStatus: 200
+};
+const app = express();
+
+// Ensure CORS headers are always present (even on crashes / cold-start errors)
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Shopify-Hmac-Sha256, X-WC-Webhook-Signature');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions)); // Explicit preflight handler for all routes
+
+// Middleware to capture raw body for webhook verification
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+
+
+// MongoDB Connection
+const MONGO_URI = process.env.MONGO_URI;
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('✅ MongoDB Atlas Connected (Averqonbill Cluster)'))
+  .catch(err => console.error('❌ MongoDB Connection Error:', err));
+
+const menuSchema = new mongoose.Schema({
+  name: String,
+  icon: String,
+  moduleKey: String,
+  category: String,
+  isAccent: { type: Boolean, default: false }
+});
+
+const permissionSchema = new mongoose.Schema({
+  companyId: String,
+  allowedMenus: [String] // Array of moduleKeys
+}, { timestamps: true });
+
+const Menu = mongoose.model('Menu', menuSchema);
+const Permission = mongoose.model('Permission', permissionSchema);
+
+// --- Health Check ---
+app.get('/health', (req, res) => res.status(200).send('OK'));
+
+// --- API Endpoints ---
+
+// Get all companies (for super admin)
+app.get('/api/companies', async (req, res) => {
+  try {
+    // Note: Company model currently removed to favor simplified demo, 
+    // but in real app we'd keep it. Using order logic as primary focus.
+    res.json([]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get menus allowed for a company
+app.get('/api/company/:companyId/menus', async (req, res) => {
+  try {
+    const permission = await Permission.findOne({ companyId: req.params.companyId });
+    if (!permission) {
+      return res.json([]);
+    }
+    const menus = await Menu.find({ moduleKey: { $in: permission.allowedMenus } });
+    res.json(menus);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Save company menu permissions
+app.post('/api/company/:companyId/menu-permissions', async (req, res) => {
+  const { allowedMenus } = req.body;
+  try {
+    const permission = await Permission.findOneAndUpdate(
+      { companyId: req.params.companyId },
+      { allowedMenus },
+      { upsert: true, new: true }
+    );
+    res.json({ message: 'Permissions saved successfully', permission });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Integration Management
+app.post('/api/integrations', async (req, res) => {
+  try {
+    const int = await Integration.findOneAndUpdate(
+      { companyId: req.body.companyId, platform: req.body.platform, storeName: req.body.storeName },
+      req.body,
+      { upsert: true, new: true }
+    );
+    res.status(201).json(int);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/integrations/:companyId', async (req, res) => {
+  try {
+    const ints = await Integration.find({ companyId: req.params.companyId });
+    res.json(ints);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/integrations/:id/sync', async (req, res) => {
+  try {
+    const int = await Integration.findById(req.params.id);
+    if (!int) return res.status(404).send('Integration not found');
+
+    console.log(`[Sync] Triggering Order Sync for ${int.platform} - ${int.storeName}`);
+    let result;
+    if (int.platform === 'shopify') {
+      result = await syncShopifyOrders(int);
+    } else if (int.platform === 'woocommerce') {
+      result = await syncWooCommerceOrders(int);
+    } else {
+      return res.status(400).send('Platform not supported for manual sync');
+    }
+
+    if (!int.health) int.health = {};
+    int.health.lastSync = new Date();
+    await int.save();
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error(`[Sync Error] Order sync failed:`, err);
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+app.post('/api/integrations/:id/sync-products', async (req, res) => {
+  try {
+    const int = await Integration.findById(req.params.id);
+    if (!int) {
+      console.warn(`[Product Sync] Integration not found: ${req.params.id}`);
+      return res.status(404).send('Integration not found');
+    }
+
+    console.log(`[Product Sync] Starting for ${int.platform} - ${int.storeName} (${int._id})`);
+    console.log(`[Product Sync] Store URL: ${int.credentials?.storeUrl}`);
+    
+    let result;
+    if (int.platform === 'shopify') {
+      result = await syncShopifyProducts(int);
+    } else if (int.platform === 'woocommerce') {
+      result = await syncWooCommerceProducts(int);
+    } else {
+      return res.status(400).send('Platform not supported for product sync');
+    }
+
+    if (!int.health) int.health = {};
+    int.health.lastSync = new Date();
+    await int.save();
+
+    console.log(`[Product Sync] SUCCESS for ${int.storeName}:`, result);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    console.error(`[Product Sync Error] Failed for ${req.params.id}:`, err);
+    res.status(500).json({ error: err.message, stack: err.stack });
+  }
+});
+
+// Seed Initial Menus
+app.post('/api/seed-menus', async (req, res) => {
+  const menus = [
+    { name: 'Dashboard', icon: 'LayoutDashboard', moduleKey: 'Dashboard', category: 'Core' },
+    { name: 'POS Terminal', icon: 'Zap', moduleKey: 'POS Billing', category: 'Sales', isAccent: true },
+    { name: 'Products', icon: 'Package', moduleKey: 'Products', category: 'Core' },
+    { name: 'Inventory', icon: 'Layers', moduleKey: 'Inventory', category: 'Core' },
+    { name: 'Customers', icon: 'Users', moduleKey: 'Customers', category: 'CRM' },
+    { name: 'Orders', icon: 'ShoppingCart', moduleKey: 'Orders', category: 'Sales' },
+    { name: 'Invoices', icon: 'Receipt', moduleKey: 'Invoices', category: 'Finance' },
+    { name: 'Reports', icon: 'BarChart3', moduleKey: 'Reports', category: 'Analytics' }
+  ];
+  try {
+    await Menu.deleteMany({});
+    await Menu.insertMany(menus);
+    res.json({ message: 'Menus seeded successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 5000;
+
+// --- Integration Webhooks ---
+
+app.post('/api/webhook/:platform/:companyId', async (req, res) => {
+    const { platform, companyId } = req.params;
+    const payload = req.body;
+
+    try {
+        const integration = await Integration.findOne({ companyId, platform: platform });
+        if (!integration) return res.status(404).send('Integration not found');
+
+        // Security Verification
+        if (platform === 'shopify') {
+            const hmac = req.headers['x-shopify-hmac-sha256'];
+            if (hmac && !verifyShopifyWebhook(req.rawBody, hmac, integration.webhookSecret)) {
+                console.warn(`[Webhook] Invalid Shopify Signature for company: ${companyId}`);
+                return res.status(401).send('Invalid Signature');
+            }
+        } else if (platform === 'woocommerce') {
+            const signature = req.headers['x-wc-webhook-signature'];
+            // Allow initial ping if signature is missing to allow save to succeed
+            if (!signature) {
+              console.log(`[Webhook] WooCommerce ping received for ${companyId} (No signature)`);
+              return res.status(200).send('Webhook Verified');
+            }
+            if (!verifyWooCommerceWebhook(req.rawBody, signature, integration.webhookSecret)) {
+                console.warn(`[Webhook] Invalid WooCommerce Signature for company: ${companyId}`);
+                return res.status(401).send('Invalid Signature');
+            }
+        }
+
+        const unifiedOrder = transformOrder(platform, payload);
+        
+        const newOrder = await Order.create({
+            ...unifiedOrder,
+            companyId
+        });
+
+        // --- Automatic Stock Updates ---
+        const stockResult = await updateStockFromOrder(companyId, newOrder);
+        console.log(`[Webhook] Order ${newOrder._id} processed. Stock updated for ${stockResult.updated} items.`);
+
+        // Update Health
+        integration.health.lastWebhook = new Date();
+        await integration.save();
+
+        res.status(201).json({ success: true, orderId: newOrder._id });
+    } catch (err) {
+        if (err.code === 11000) {
+            return res.status(200).json({ success: true, message: 'Duplicate order ignored' });
+        }
+        res.status(500).send('Internal Server Error');
+    }
+});
+
+app.put('/api/products/:id', async (req, res) => {
+    const { companyId, ...updateData } = req.body;
+    try {
+        const product = await Product.findByIdAndUpdate(req.params.id, updateData, { new: true });
+        if (!product) return res.status(404).json({ error: 'Product not found' });
+
+        // Push to external platform if integrated
+        if (product.platform && product.externalId) {
+            await pushProductToPlatform(companyId, product._id, updateData);
+        }
+
+        res.json(product);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/products/:id', async (req, res) => {
+    try {
+        await Product.findByIdAndDelete(req.params.id);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/products/:id/adjust-stock', async (req, res) => {
+    const { qty, companyId } = req.body;
+    try {
+        const product = await Product.findById(req.params.id);
+        if (!product) return res.status(404).send('Product not found');
+
+        product.stock = qty;
+        await product.save();
+
+        // Push to external platform if integrated
+        if (product.platform && product.externalId) {
+            await pushInventoryToPlatform(companyId, product._id, qty);
+        }
+
+        res.json({ success: true, newStock: product.stock });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/orders/:companyId', async (req, res) => {
+    try {
+        const orders = await Order.find({ companyId: req.params.companyId }).sort({ createdAt: -1 });
+        res.json(orders);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/products/:companyId', async (req, res) => {
+    try {
+        const products = await Product.find({ companyId: req.params.companyId }).sort({ createdAt: -1 });
+        res.json(products);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/orders/:id', async (req, res) => {
+    try {
+        const order = await Order.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        if (!order) return res.status(404).json({ error: 'Order not found' });
+        res.json(order);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- Product Webhooks (Real-time Sync) ---
+app.post('/api/webhook/products/:platform/:companyId', async (req, res) => {
+    const { platform, companyId } = req.params;
+    const payload = req.body;
+
+    try {
+        const integration = await Integration.findOne({ companyId, platform });
+        if (!integration) return res.status(404).send('Integration not found');
+
+        // Security Verification (Same as orders)
+        if (platform === 'shopify') {
+            const hmac = req.headers['x-shopify-hmac-sha256'];
+            if (hmac && !verifyShopifyWebhook(req.rawBody, hmac, integration.webhookSecret)) {
+                return res.status(401).send('Invalid Signature');
+            }
+        } else if (platform === 'woocommerce') {
+            const signature = req.headers['x-wc-webhook-signature'];
+            if (signature && !verifyWooCommerceWebhook(req.rawBody, signature, integration.webhookSecret)) {
+                return res.status(401).send('Invalid Signature');
+            }
+        }
+
+        const unified = transformProduct(platform, payload);
+        
+        await Product.findOneAndUpdate(
+            { companyId, externalId: unified.externalId, platform },
+            { ...unified, companyId },
+            { upsert: true, new: true }
+        );
+
+        console.log(`[Product Webhook] ${platform} product updated: ${unified.name}`);
+        res.status(200).send('Product Updated');
+    } catch (err) {
+        console.error('Product Webhook Error:', err.message);
+        res.status(500).send('Server Error');
+    }
+});
+app.post('/api/orders/:id/update-status', async (req, res) => {
+    const { id } = req.params;
+    const { status, companyId } = req.body;
+
+    try {
+        const order = await Order.findById(id);
+        if (!order) return res.status(404).send('Order not found');
+
+        order.status = status;
+        await order.save();
+
+        if (order.platform) {
+            await pushOrderStatusToPlatform(companyId, id, status);
+        }
+
+        res.json({ success: true, status });
+    } catch (err) {
+        console.error(`[Status Update Error]`, err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+
+
+// --- Supplier Management ---
+
+app.get('/api/suppliers', async (req, res) => {
+    const { companyId } = req.query;
+    try {
+        const suppliers = await Supplier.find({ companyId });
+        res.json(suppliers);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/suppliers', async (req, res) => {
+    try {
+        const supplier = new Supplier(req.body);
+        await supplier.save();
+        res.status(201).json(supplier);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/suppliers/:id', async (req, res) => {
+    try {
+        const supplier = await Supplier.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        res.json(supplier);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.delete('/api/suppliers/:id', async (req, res) => {
+    try {
+        await Supplier.findByIdAndDelete(req.params.id);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- Purchase Orders ---
+
+app.get('/api/purchase-orders', async (req, res) => {
+    const { companyId } = req.query;
+    try {
+        const pos = await PurchaseOrder.find({ companyId }).populate('supplierId').sort({ createdAt: -1 });
+        res.json(pos);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/purchase-orders', async (req, res) => {
+    try {
+        const poData = req.body;
+        // Simple auto-increment for order number if not provided
+        if (!poData.orderNumber) {
+            const count = await PurchaseOrder.countDocuments({ companyId: poData.companyId });
+            poData.orderNumber = `PO-${String(count + 1).padStart(5, '0')}`;
+        }
+        const po = new PurchaseOrder(poData);
+        await po.save();
+        res.status(201).json(po);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.put('/api/purchase-orders/:id/receive', async (req, res) => {
+    try {
+        const po = await PurchaseOrder.findById(req.params.id);
+        if (!po) return res.status(404).json({ error: 'Purchase Order not found' });
+
+        const { items } = req.body; // Array of { variantId, receivedQty }
+
+        // Update received quantities in PO
+        if (items) {
+            items.forEach(updateItem => {
+                const poItem = po.items.find(i => i.variantId.toString() === updateItem.variantId);
+                if (poItem) {
+                    poItem.receivedQty = (poItem.receivedQty || 0) + Number(updateItem.receivedQty);
+                }
+            });
+        }
+
+        // Determine status
+        const allReceived = po.items.every(i => (i.receivedQty || 0) >= i.qty);
+        po.status = allReceived ? 'received' : 'partially_received';
+        po.receivedDate = new Date();
+        
+        await po.save();
+
+        // Update Inventory
+        await receiveStock(po.companyId, {
+            warehouseId: po.warehouseId,
+            items: items || po.items // Use the partial items if provided, else full list
+        });
+
+        res.json(po);
+    } catch (err) {
+        console.error('[PO Receive Error]', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- Warehouses ---
+
+app.get('/api/warehouses', async (req, res) => {
+    const { companyId } = req.query;
+    try {
+        let warehouses = await Warehouse.find({ companyId });
+        if (warehouses.length === 0) {
+            // Create a default warehouse if none exists
+            const defaultWh = new Warehouse({
+                companyId,
+                name: 'Main Warehouse',
+                location: 'Default Location',
+                isDefault: true
+            });
+            await defaultWh.save();
+            warehouses = [defaultWh];
+        }
+        res.json(warehouses);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// --- Stock / Inventory ---
+
+app.get('/api/inventory', async (req, res) => {
+    const { companyId, warehouseId } = req.query;
+    try {
+        const query = warehouseId ? { warehouseId } : { companyId };
+        const inventory = await Inventory.find(query).populate({
+            path: 'variantId',
+            populate: { path: 'productId' }
+        });
+        res.json(inventory);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/variants', async (req, res) => {
+    const { companyId } = req.query;
+    try {
+        const products = await Product.find({ companyId });
+        const productIds = products.map(p => p._id);
+        const variants = await Variant.find({ productId: { $in: productIds } }).populate('productId');
+        res.json(variants);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
+server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE') {
+        console.error(`⚠️  Port ${PORT} is in use. Retrying in 1s...`);
+        setTimeout(() => {
+            server.close();
+            server.listen(PORT);
+        }, 1000);
+    } else {
+        throw err;
+    }
+});
